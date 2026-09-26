@@ -106,10 +106,42 @@ Authentication signatures use `SENTRA-AUTH-v1`; message signatures use `SENTRA-M
 ## Open questions
 
 - Should offline messages be queued, and how should that interact with forward secrecy?
+  **Resolved (network layer):** yes. See `network/offline_queue.py` — a SQLite-backed queue
+  keyed by recipient, drained in order on next successful authentication. Forward secrecy is
+  unaffected because queuing operates on the opaque `ciphertext_b64` blob; whatever
+  confidentiality/forward-secrecy properties the payload encryption layer provides are preserved
+  end-to-end regardless of how long a message sits in the queue.
 - Should session keys use X25519 plus HKDF, and where should key rotation occur?
+  **Still open** — owned by the crypto/security module, not the network layer. The network layer
+  treats `ciphertext_b64` as an opaque blob it never decrypts; see `NETWORK.md` for the current
+  placeholder used to keep the transport testable end-to-end in the meantime.
 - Is TLS in scope for the demo or only for deployment?
+  **Resolved:** mutual TLS 1.2+ is required for every connection, demo included. See
+  `network/tls_config.py` and `scripts/generate_dev_certs.py` for the dev PKI.
 - Will mutual TLS (mTLS) be implemented in addition to application-level Ed25519 authentication?
+  **Resolved: yes, both.** mTLS authenticates the transport (holder of a CA-issued cert); the
+  Ed25519 challenge-response in `auth.challenge` independently authenticates the application
+  identity. Neither layer substitutes for the other.
+
+## Network-layer packet type additions
+
+The following packet types were added by the network layer on top of the types above. They are
+documented here because they're part of the same wire format (length-prefixed JSON) and flow
+through the same connections, even though they weren't in the original proposal.
+
+| Type | Direction | Fields | Purpose |
+|---|---|---|---|
+| `HEARTBEAT_PING` | either direction | `nonce` | Liveness probe; sent every 15s by both peers |
+| `HEARTBEAT_PONG` | either direction | `nonce` | Echoes the ping's nonce; absence for >40s closes the connection |
+| `SESSION_INFO` | server → client | `session_id`, `active_sessions` | Sent right after `AUTH_RESULT:OK`; tells the client its session id and how many sessions (devices) this account currently has open |
+| `MESSAGE_ACK` | client → server → original sender | `message_id` (client→server); `message_id`, `acked_by` (server→sender) | Application-level "the recipient actually received and verified this message," distinct from `DELIVERY_STATUS` which only reports whether the server could hand the packet to a live session |
+
+See `NETWORK.md` for the full network-layer design (session lifecycle, incident detection
+thresholds, structured event log format, and how to run a local demo).
 
 ## Change log
 
 - `0.1-draft` — initial proposal
+- `0.2` — network layer implemented: mTLS transport, heartbeat/ACK/reconnect/multi-session/offline
+  queue packet types and behavior, structured security events, backend incident detection. See
+  `NETWORK.md`.

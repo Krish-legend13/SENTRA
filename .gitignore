@@ -3,6 +3,11 @@ data_*/
 *.pem
 *.vault
 
+# Network layer: dev mTLS PKI and runtime state (never commit private keys
+# or live databases/logs)
+certs/
+data/
+
 # Python
 __pycache__/
 *.py[cod]
