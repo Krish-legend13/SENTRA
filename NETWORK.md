@@ -101,17 +101,26 @@ windows, no external dependency:
 
 All of the above is exercised in `scripts/integration_check.py`.
 
-## What's deliberately NOT here: payload encryption
+## Payload encryption
 
-`signing.envelope.SignedEnvelope.ciphertext_b64` is signed and routed, but
-never decrypted, by anything in `network/`. That's correct separation of
-concerns — the server should never need to decrypt a message it's just
-relaying, and the wire protocol's own open questions list ("should session
-keys use X25519 + HKDF, and where should key rotation occur?") assign that
-to the crypto/security module. `network/client.py`'s `_seal`/`_open`
-functions are an explicit, documented placeholder (base64 of the plaintext)
-so the transport is testable end-to-end today; swap those two functions for
-real AEAD encryption once that module exists and nothing else changes.
+`crypto.encryption` encrypts each plaintext on the sender and decrypts it on
+the recipient. The sender converts the recipient's Ed25519 public identity to
+X25519, generates a fresh ephemeral X25519 key for every message, derives a
+32-byte key with HKDF-SHA256, and encrypts with AES-256-GCM using a fresh
+12-byte nonce. The sender, recipient, and message ID are authenticated as
+associated data.
+
+The resulting opaque payload, including the ephemeral public key, salt, nonce,
+and GCM ciphertext/tag, is stored in `SignedEnvelope.ciphertext_b64`. The
+complete envelope is signed with Ed25519 before transmission. The server
+verifies and routes the signed envelope, but never decrypts message contents;
+offline queueing stores the same opaque signed envelope.
+
+This design uses the existing Ed25519 identity for deterministic X25519 key
+conversion, so it does not provide forward secrecy against compromise of a
+long-term identity key. It also reuses one identity across signing and key
+agreement; a production design should assess that protocol-binding tradeoff
+and may use separately provisioned keys.
 
 ## Running it
 
@@ -140,8 +149,6 @@ python scripts/integration_check.py
 
 ## Known gaps / next steps
 
-- **Payload encryption** (see above) — blocked on the crypto module's
-  X25519/HKDF design.
 - **Dev PKI only.** `scripts/generate_dev_certs.py` is explicitly not a real
   CA workflow (no revocation, no intermediate CA, 825-day dev certs). Fine
   for coursework/demo; would need real issuance for anything beyond that.

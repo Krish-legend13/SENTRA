@@ -1,17 +1,11 @@
 """SENTRA network client.
 
-Connects over mTLS, registers/authenticates with the Ed25519
-challenge-response flow, maintains a bidirectional heartbeat, and
-automatically reconnects (with a full, fresh authentication -- never a
-resumed session) if the connection drops.
+Connects over mTLS, authenticates with Ed25519 challenge-response, maintains
+heartbeat/reconnect behavior, and performs end-to-end payload encryption.
 
-NOTE ON PAYLOAD ENCRYPTION: this client is the network/transport layer. The
-`ciphertext_b64` field it sends is currently a placeholder (base64 of the
-plaintext) because end-to-end payload encryption (X25519 + HKDF, per
-PROTOCOL.md's open questions) is owned by the crypto/security module, not
-the network layer. The signature over that field, and mTLS in transport,
-are real. Swap `_seal`/`_open` below for real AEAD encryption once that
-module lands -- nothing else in this file needs to change.
+Payload confidentiality is client-side: each message uses X25519 + HKDF +
+AES-256-GCM from ``crypto.encryption``. The server only routes the opaque
+ciphertext and still verifies the Ed25519 signature over that ciphertext.
 """
 
 from __future__ import annotations
@@ -25,7 +19,8 @@ import uuid
 from datetime import datetime, timezone
 
 from auth.challenge import DOMAIN_STRING as AUTH_DOMAIN_STRING
-from crypto.keys import PathType, serialize_public_key
+from crypto.encryption import encrypt_payload
+from crypto.keys import PathType, deserialize_public_key, serialize_public_key
 from crypto.signatures import canonical_bytes
 from identity.manager import IdentityManager
 from network.framing import ConnectionClosed, FrameError, recv_packet, send_packet
@@ -42,16 +37,6 @@ HEARTBEAT_INTERVAL_SECONDS = 15
 HEARTBEAT_TIMEOUT_SECONDS = 40
 RECONNECT_BASE_DELAY_SECONDS = 1
 RECONNECT_MAX_DELAY_SECONDS = 30
-
-
-def _seal(plaintext: str) -> str:
-    """Placeholder payload encoding -- see module docstring."""
-    return base64.b64encode(plaintext.encode("utf-8")).decode("ascii")
-
-
-def _open(ciphertext_b64: str) -> str:
-    """Placeholder payload decoding -- see module docstring."""
-    return base64.b64decode(ciphertext_b64).decode("utf-8")
 
 
 class SentraClient:
@@ -75,7 +60,7 @@ class SentraClient:
 
         self._sock: ssl.SSLSocket | None = None
         self._send_lock = threading.Lock()
-        self._sequence = int(time.time_ns())  # monotonically increasing across restarts
+        self._sequence = int(time.time_ns())
 
         self._peer_keys: dict[str, object] = {}
         self._pending_key_waiters: dict[str, threading.Event] = {}
@@ -85,8 +70,6 @@ class SentraClient:
         self._last_pong_at = time.monotonic()
         self._stop = threading.Event()
         self._connected = threading.Event()
-
-    # ---- public API -------------------------------------------------------
 
     def run_forever(self) -> None:
         """Connect, authenticate, and keep reconnecting until stop() is called."""
@@ -119,11 +102,22 @@ class SentraClient:
         return self._connected.wait(timeout)
 
     def send_message(self, recipient: str, plaintext: str) -> str:
-        """Sign and send a chat message. Returns the generated message_id."""
+        """Encrypt, sign, and send a chat message."""
+        recipient_key = self.request_identity(recipient)
+        if recipient_key is None:
+            raise ValueError(f"recipient identity unavailable: {recipient}")
+
         message_id = uuid.uuid4().hex
         self._sequence += 1
         timestamp = datetime.now(timezone.utc).isoformat()
-        ciphertext_b64 = _seal(plaintext)
+
+        ciphertext_b64 = encrypt_payload(
+            plaintext=plaintext,
+            sender=self.identity.username,
+            recipient=recipient,
+            message_id=message_id,
+            recipient_public_key=recipient_key,
+        )
         envelope = self._sign_envelope(recipient, message_id, timestamp, ciphertext_b64)
         packet = envelope_to_dict(envelope)
         packet["type"] = "CHAT_MESSAGE"
@@ -131,19 +125,17 @@ class SentraClient:
         return message_id
 
     def request_identity(self, target_username: str, timeout: float = 5.0):
-        """Fetch (and cache) a peer's registered Ed25519 public key."""
+        """Fetch and cache a peer's registered Ed25519 public key."""
         with self._peer_keys_lock:
             if target_username in self._peer_keys:
                 return self._peer_keys[target_username]
             event = self._pending_key_waiters.setdefault(target_username, threading.Event())
+
         self._send({"type": "IDENTITY_REQUEST", "target_username": target_username})
         event.wait(timeout)
+
         with self._peer_keys_lock:
             return self._peer_keys.get(target_username)
-
-    # ---- internal: signing helpers (never touch the identity's private key
-    # directly; IdentityManager only exposes .sign(), so we build the same
-    # domain-separated inputs the security module uses and sign those) -------
 
     def _sign_envelope(self, recipient, message_id, timestamp, ciphertext_b64) -> SignedEnvelope:
         signing_input = build_signing_input(
@@ -169,8 +161,6 @@ class SentraClient:
         signing_input = canonical_bytes(AUTH_DOMAIN_STRING, challenge)
         return self.identity.sign(signing_input)
 
-    # ---- connection + auth --------------------------------------------------
-
     def _connect_and_authenticate(self) -> None:
         raw_sock = socket.create_connection((self.host, self.port), timeout=10)
         self._sock = self.tls_context.wrap_socket(raw_sock, server_hostname="localhost")
@@ -181,42 +171,50 @@ class SentraClient:
         self._send({"type": "AUTH_REQUEST", "username": self.identity.username})
         challenge_packet = recv_packet(self._sock)
         if challenge_packet.get("type") != "AUTH_CHALLENGE":
-            raise ConnectionClosed(f"Unexpected packet during auth: {challenge_packet.get('type')}")
+            raise ConnectionClosed(
+                f"Unexpected packet during auth: {challenge_packet.get('type')}"
+            )
 
         challenge = base64.b64decode(challenge_packet["challenge_b64"])
         signature = self._sign_auth_challenge(challenge)
-        self._send({
-            "type": "AUTH_RESPONSE",
-            "challenge_id": challenge_packet["challenge_id"],
-            "signature_b64": base64.b64encode(signature).decode("ascii"),
-        })
+        self._send(
+            {
+                "type": "AUTH_RESPONSE",
+                "challenge_id": challenge_packet["challenge_id"],
+                "signature_b64": base64.b64encode(signature).decode("ascii"),
+            }
+        )
 
         result_packet = recv_packet(self._sock)
         if result_packet.get("type") != "AUTH_RESULT" or result_packet.get("status") != "OK":
-            raise ConnectionClosed(f"Authentication failed: {result_packet.get('reason')}")
+            raise ConnectionClosed(
+                f"Authentication failed: {result_packet.get('reason')}"
+            )
 
         self._last_pong_at = time.monotonic()
 
     def _register_if_needed(self) -> None:
         pem_bytes = serialize_public_key(self.identity.public_key)
-        self._send({
-            "type": "REGISTER_IDENTITY",
-            "username": self.identity.username,
-            "public_key_pem_b64": base64.b64encode(pem_bytes).decode("ascii"),
-            "fingerprint": self.identity.fingerprint,
-        })
+        self._send(
+            {
+                "type": "REGISTER_IDENTITY",
+                "username": self.identity.username,
+                "public_key_pem_b64": base64.b64encode(pem_bytes).decode("ascii"),
+                "fingerprint": self.identity.fingerprint,
+            }
+        )
         ack = recv_packet(self._sock)
         if ack.get("type") == "REGISTER_IDENTITY_ACK" and ack.get("status") == "REJECTED":
             reason = ack.get("reason", "")
             if "already registered" not in reason.lower():
                 self.on_event(f"Registration rejected: {reason}")
 
-    # ---- session loop: heartbeat + receive ------------------------------
-
     def _session_loop(self) -> None:
         heartbeat_stop = threading.Event()
         heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop, args=(heartbeat_stop,), daemon=True
+            target=self._heartbeat_loop,
+            args=(heartbeat_stop,),
+            daemon=True,
         )
         heartbeat_thread.start()
         try:
@@ -254,30 +252,37 @@ class SentraClient:
         elif packet_type == "CHAT_MESSAGE":
             self._handle_chat_message(packet)
         elif packet_type == "DELIVERY_STATUS":
-            self.on_event(f"Message {packet.get('message_id')}: {packet.get('status')}")
+            self.on_event(
+                f"Message {packet.get('message_id')}: {packet.get('status')}"
+            )
         elif packet_type == "MESSAGE_ACK":
-            self.on_event(f"Message {packet.get('message_id')} acknowledged by {packet.get('acked_by')}")
+            self.on_event(
+                f"Message {packet.get('message_id')} acknowledged by "
+                f"{packet.get('acked_by')}"
+            )
         elif packet_type == "ERROR":
-            self.on_event(f"Server error: {packet.get('reason')} {packet.get('detail', '')}")
+            self.on_event(
+                f"Server error: {packet.get('reason')} {packet.get('detail', '')}"
+            )
         else:
             self.on_event(f"Unhandled packet type: {packet_type}")
 
     def _handle_identity_response(self, packet: dict) -> None:
-        from crypto.keys import deserialize_public_key
         target = packet.get("target_username")
         pem_b64 = packet.get("public_key_pem_b64")
         replayable: list[dict] = []
+
         with self._peer_keys_lock:
             if pem_b64:
-                self._peer_keys[target] = deserialize_public_key(base64.b64decode(pem_b64))
+                self._peer_keys[target] = deserialize_public_key(
+                    base64.b64decode(pem_b64)
+                )
             event = self._pending_key_waiters.pop(target, None)
             replayable = self._pending_messages.pop(target, [])
+
         if event is not None:
             event.set()
-        # Now that the key has arrived, finish verifying/delivering any
-        # messages from this sender that were waiting on it. This runs on
-        # the same receive thread, but *after* returning from the original
-        # blocking wait -- it never blocks itself, so no deadlock.
+
         for pending_packet in replayable:
             self._process_chat_message(pending_packet)
 
@@ -295,34 +300,48 @@ class SentraClient:
                 self._pending_messages.setdefault(envelope.sender, []).append(packet)
 
         if not have_key:
-            # Fire the lookup without blocking this (the one and only)
-            # receive thread; _handle_identity_response will finish the job
-            # when the response arrives on a later iteration of this loop.
             if not already_requested:
-                self._send({"type": "IDENTITY_REQUEST", "target_username": envelope.sender})
+                self._send(
+                    {
+                        "type": "IDENTITY_REQUEST",
+                        "target_username": envelope.sender,
+                    }
+                )
             return
 
         self._process_chat_message(packet)
 
     def _process_chat_message(self, packet: dict) -> None:
         envelope = envelope_from_dict(packet)
+
         with self._peer_keys_lock:
             sender_key = self._peer_keys.get(envelope.sender)
 
         if sender_key is None or not verify_envelope(sender_key, envelope):
-            self.on_event(f"Signature verification FAILED for message from {envelope.sender}; dropped")
+            self.on_event(
+                f"Signature verification FAILED for message from "
+                f"{envelope.sender}; dropped"
+            )
             return
 
         try:
-            plaintext = _open(envelope.ciphertext_b64)
-        except Exception:
-            self.on_event("Failed to decode message payload")
+            plaintext = self.identity.decrypt_payload(
+                ciphertext_b64=envelope.ciphertext_b64,
+                sender=envelope.sender,
+                recipient=envelope.recipient,
+                message_id=envelope.message_id,
+            )
+        except ValueError as exc:
+            self.on_event(
+                f"Payload decryption FAILED for message from "
+                f"{envelope.sender}: {exc}"
+            )
             return
 
         self.on_message(envelope.sender, plaintext)
-        self._send({"type": "MESSAGE_ACK", "message_id": envelope.message_id})
-
-    # ---- plumbing -----------------------------------------------------------
+        self._send(
+            {"type": "MESSAGE_ACK", "message_id": envelope.message_id}
+        )
 
     def _send(self, packet: dict) -> None:
         with self._send_lock:
@@ -332,12 +351,6 @@ class SentraClient:
         if self._sock is not None:
             sock, self._sock = self._sock, None
             try:
-                # Raw socket-layer shutdown, not SSL unwrap: stop() can be
-                # called from a thread other than the one blocked in
-                # recv_packet() inside _session_loop. shutdown() is safe to
-                # call concurrently on the same fd from another thread and
-                # reliably unblocks that recv(); unwrap() would perform TLS
-                # I/O concurrently with the blocked read, which is not safe.
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass

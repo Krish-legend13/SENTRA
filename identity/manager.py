@@ -18,6 +18,7 @@ from crypto.keys import (
 )
 from crypto.signatures import sign as sign_data
 from crypto.signatures import verify as verify_data
+from crypto.encryption import decrypt_payload as decrypt_encrypted_payload
 from crypto.vault import (
     load_key_from_vault,
     save_key_to_vault,
@@ -185,6 +186,22 @@ class IdentityManager:
             TypeError: If data is not bytes.
         """
         return sign_data(self._private_key, data)
+
+    def decrypt_payload(
+        self,
+        ciphertext_b64: str,
+        sender: str,
+        recipient: str,
+        message_id: str,
+    ) -> str:
+        """Decrypt a payload for this identity without exposing its key."""
+        return decrypt_encrypted_payload(
+            ciphertext_b64=ciphertext_b64,
+            recipient_private_key=self._private_key,
+            sender=sender,
+            recipient=recipient,
+            message_id=message_id,
+        )
 
     def verify(self, signature: bytes, data: bytes) -> bool:
         """Verify a signature using this manager's own public key.

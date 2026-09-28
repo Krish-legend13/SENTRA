@@ -99,6 +99,31 @@ Server to client. `reason` is a stable error category or message. `detail` is op
 5. The recipient verifies the signature against the sender's registered public key before decrypting the ciphertext. Any field change, including routing, timestamp, sequence, or ciphertext changes, invalidates the signature.
 6. The server reports `DELIVERY_STATUS` for the message when delivery succeeds or the recipient is offline.
 
+### Payload encryption
+
+Before signing the envelope, the sender encrypts the plaintext for the
+recipient with the implementation in `crypto/encryption.py`:
+
+1. The recipient's Ed25519 public identity is converted to X25519.
+2. A fresh ephemeral X25519 key pair is generated for each message and used
+  for key agreement with the recipient.
+3. HKDF-SHA256 derives a 32-byte AES key from the shared secret and a fresh
+  random salt. The sender, recipient, and message ID are bound as AES-GCM
+  associated data.
+4. AES-256-GCM encrypts the UTF-8 plaintext with a fresh 12-byte nonce. The
+  payload carries the version, ephemeral public key, salt, nonce, and
+  ciphertext plus authentication tag, encoded as `ciphertext_b64`.
+
+The Ed25519 signed envelope authenticates the ciphertext and its routing
+metadata. The server routes and queues this opaque ciphertext and never needs
+the plaintext or the decryption key. The recipient verifies the Ed25519
+signature before AES-GCM authentication and decryption.
+
+The current design converts the existing long-term Ed25519 identity into an
+X25519 identity, so compromise of that identity can expose recorded payloads;
+this is not a forward-secret messaging design. Separately provisioned key
+agreement keys and a key-rotation strategy remain production considerations.
+
 ## Domain separation
 
 Authentication signatures use `SENTRA-AUTH-v1`; message signatures use `SENTRA-MSG-v1`. These domain strings are distinct and are part of each canonical signing input. A signature generated in one context must never verify in the other context.
@@ -111,10 +136,12 @@ Authentication signatures use `SENTRA-AUTH-v1`; message signatures use `SENTRA-M
   unaffected because queuing operates on the opaque `ciphertext_b64` blob; whatever
   confidentiality/forward-secrecy properties the payload encryption layer provides are preserved
   end-to-end regardless of how long a message sits in the queue.
-- Should session keys use X25519 plus HKDF, and where should key rotation occur?
-  **Still open** — owned by the crypto/security module, not the network layer. The network layer
-  treats `ciphertext_b64` as an opaque blob it never decrypts; see `NETWORK.md` for the current
-  placeholder used to keep the transport testable end-to-end in the meantime.
+- How should long-term key rotation and separately provisioned key-agreement
+  keys be introduced? The current implementation uses per-message ephemeral
+  X25519 keys with HKDF-SHA256 and AES-256-GCM, while deriving the recipient
+  X25519 identity from the existing Ed25519 identity. Production deployment
+  should define rotation and evaluate whether separate identity and key-
+  agreement keys are required.
 - Is TLS in scope for the demo or only for deployment?
   **Resolved:** mutual TLS 1.2+ is required for every connection, demo included. See
   `network/tls_config.py` and `scripts/generate_dev_certs.py` for the dev PKI.
