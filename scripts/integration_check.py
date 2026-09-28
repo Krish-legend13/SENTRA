@@ -11,6 +11,7 @@ Run: python scripts/integration_check.py
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 import threading
@@ -72,10 +73,22 @@ def main():
     print("PASS: both clients authenticated\n")
 
     print("== Test 2: online message delivery + signature verify + ACK ==")
-    alice.send_message("bob", "hello bob, this is alice")
+    plaintext = "hello bob, this is alice"
+    wire_packets: list[dict] = []
+    original_alice_send = alice._send
+
+    def capture_alice_send(packet: dict) -> None:
+        wire_packets.append(dict(packet))
+        original_alice_send(packet)
+
+    alice._send = capture_alice_send
+    alice.send_message("bob", plaintext)
+    chat_packets = [packet for packet in wire_packets if packet.get("type") == "CHAT_MESSAGE"]
+    assert len(chat_packets) == 1, chat_packets
+    assert plaintext not in json.dumps(chat_packets[0], sort_keys=True)
     time.sleep(1)
-    assert bob_inbox == [("alice", "hello bob, this is alice")], bob_inbox
-    print("PASS: bob received and verified alice's message\n")
+    assert bob_inbox == [("alice", plaintext)], bob_inbox
+    print("PASS: encrypted wire payload delivered and decrypted by bob\n")
 
     print("== Test 3: multi-session fanout (alice logs in from a second device) ==")
     alice_inbox_2: list = []
