@@ -1,417 +1,933 @@
-import os
-import sys
-import socket
-import threading
-import json
-import base64
-import tkinter as tk
-from tkinter import scrolledtext, messagebox, font
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives import hashes, serialization
-import datetime
-import ctypes
+"""
+SENTRA GUI Launcher
 
-# --- Configuration / Theme ---
+This GUI uses the current SENTRA network architecture:
+
+    GUI
+      ↓
+    IdentityManager
+      ↓
+    SentraClient
+      ↓
+    mTLS + Ed25519 authentication
+      ↓
+    X25519 + HKDF-SHA256 + AES-256-GCM
+      ↓
+    SentraServer
+
+Run:
+    python scripts/generate_dev_certs.py --clients SENDER RECEIVER
+    python main.py
+
+The GUI does NOT implement its own RSA encryption or raw socket protocol.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from pathlib import Path
+import tkinter as tk
+from tkinter import scrolledtext, messagebox, font, simpledialog
+
+from identity.manager import IdentityManager
+from network.client import SentraClient
+from network.server import SentraServer
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 THEME = {
-    "bg": "#0d1117",       # Dark background
-    "fg": "#00ffff",       # Cyan text
-    "success": "#00ff00",  # Green
-    "error": "#ff0000",    # Red
-    "accent": "#00ffff"
+    "bg": "#0d1117",
+    "fg": "#00ffff",
+    "success": "#00ff00",
+    "error": "#ff0000",
+    "accent": "#00ffff",
+    "panel": "#111111",
+    "input": "#222222",
 }
 
-SERVER_HOST = '127.0.0.1'
+SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 65432
 
-# --- Admin Check ---
-def is_admin():
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
+BASE = Path(__file__).resolve().parent
+CERTS = BASE / "certs"
+DATA = BASE / "data"
 
-# --- Crypto Helper Functions ---
-def generate_keys(private_key_path="private_key.pem", public_key_path="public_key.pem"):
-    if os.path.exists(private_key_path) and os.path.exists(public_key_path):
-        return
-    print(f"Generating new RSA key pair for {os.path.dirname(public_key_path)}...")
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
-    
-    pem_private = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    )
-    pem_public = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-    
-    with open(private_key_path, "wb") as f:
-        f.write(pem_private)
-    with open(public_key_path, "wb") as f:
-        f.write(pem_public)
 
-def load_private_key(path="private_key.pem"):
-    with open(path, "rb") as f:
-        return serialization.load_pem_private_key(f.read(), password=None)
+# ============================================================
+# SENTRA APPLICATION
+# ============================================================
 
-def get_public_key_bytes(path="public_key.pem"):
-    with open(path, "rb") as f:
-        return f.read()
-
-def encrypt_message(message, public_key):
-    return public_key.encrypt(
-        message.encode('utf-8'),
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    )
-
-def decrypt_message(ciphertext, private_key):
-    return private_key.decrypt(
-        ciphertext,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    ).decode('utf-8')
-
-# --- Server Logic ---
-server_clients = {}
-server_lock = threading.Lock()
-
-def handle_client(client_socket):
-    username = None
-    try:
-        handshake_data = client_socket.recv(4096).decode('utf-8')
-        if not handshake_data: return
-        
-        data = json.loads(handshake_data)
-        username = data.get("username")
-        public_key_b64 = data.get("public_key")
-        
-        with server_lock:
-            server_clients[client_socket] = {
-                "username": username.upper(),
-                "public_key": public_key_b64
-            }
-            
-        print(f"Connection accepted: {username}")
-        
-        while True:
-            message = client_socket.recv(4096).decode('utf-8')
-            if not message: break
-            
-            packet = json.loads(message)
-            
-            # Handle Key Request
-            if packet.get("type") == "KEY_REQUEST":
-                target_username = packet.get("target", "").upper()
-                with server_lock:
-                    target_client = next(
-                        (cs for cs, info in server_clients.items() if info["username"] == target_username), 
-                        None
-                    )
-                    if target_client:
-                        target_key = server_clients[target_client]["public_key"]
-                        response = {
-                            "type": "KEY_RESPONSE",
-                            "target": target_username,
-                            "public_key": target_key
-                        }
-                        client_socket.send(json.dumps(response).encode('utf-8'))
-                    else:
-                        client_socket.send(json.dumps({"type": "KEY_RESPONSE", "target": target_username}).encode('utf-8'))
-            
-            # Handle normal encrypted messages
-            elif packet.get("type") == "MESSAGE":
-                target_username = packet.get("target", "").upper()
-                with server_lock:
-                    recipient_socket = next(
-                        (cs for cs, info in server_clients.items() if info["username"] == target_username), 
-                        None
-                    )
-                    if recipient_socket:
-                        recipient_socket.send(message.encode('utf-8'))
-                        print(f"Routed message from {username} to {target_username}")
-
-    except Exception as e:
-        print(f"Client handling error: {e}")
-    finally:
-        with server_lock:
-            if client_socket in server_clients:
-                del server_clients[client_socket]
-        client_socket.close()
-        print(f"Client disconnected: {username}")
-
-def start_server_logic(status_callback):
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
-    try:
-        server_socket.bind((SERVER_HOST, SERVER_PORT))
-        server_socket.listen()
-        status_callback(f"Server ONLINE @ {SERVER_HOST}:{SERVER_PORT}", THEME["success"])
-        
-        while True:
-            client_socket, _ = server_socket.accept()
-            threading.Thread(target=handle_client, args=(client_socket,), daemon=True).start()
-            
-    except Exception as e:
-        status_callback(f"Server Error: {e}", THEME["error"])
-    finally:
-        server_socket.close()
-
-# --- Secure Messaging Client ---
 class SecureMessagingApp(tk.Toplevel):
-    def __init__(self, master, username, recipient_name):
+    """
+    GUI terminal backed by the real SENTRA SentraClient.
+
+    All network communication and encryption is handled by the
+    existing SENTRA network/security modules.
+    """
+
+    def __init__(
+        self,
+        master,
+        username: str,
+        recipient_name: str,
+        passphrase: str,
+    ):
         super().__init__(master)
-        self.username = username.upper()
-        self.recipient_name = recipient_name.upper()
-        
-        self.title(f"SENTRA Secure Terminal - {self.username}")
+
+        self.username_input = username.strip()
+        self.recipient_name = recipient_name.strip()
+
+        self.server_host = SERVER_HOST
+        self.server_port = SERVER_PORT
+
+        self.title(
+            f"SENTRA Secure Terminal - {self.username_input}"
+        )
         self.geometry("900x650")
         self.configure(bg=THEME["bg"])
         self.minsize(800, 600)
-        
-        self.SERVER_HOST = '127.0.0.1'
-        self.SERVER_PORT = 65432
-        
-        self.user_data_dir = f"data_{self.username}"
-        os.makedirs(self.user_data_dir, exist_ok=True)
-        
-        self.PRIVATE_KEY_FILE = os.path.join(self.user_data_dir, "private_key.pem")
-        self.PUBLIC_KEY_FILE = os.path.join(self.user_data_dir, "public_key.pem")
-        
-        self.client_socket = None
-        self.recipient_public_key = None
-        
-        self.load_client_keys()
+
+        self.client: SentraClient | None = None
+        self.identity: IdentityManager | None = None
+
         self.setup_ui()
-        self.connect_to_server()
-        
+
+        try:
+            self.identity = IdentityManager.load_or_create(
+                self.username_input,
+                passphrase,
+                data_root=str(DATA),
+            )
+
+            self.username = self.identity.username
+
+            self.update_identity_display()
+
+            self.start_client()
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Identity / Connection Error",
+                f"Could not initialize SENTRA identity:\n\n{exc}",
+                parent=self,
+            )
+            self.destroy()
+            return
+
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-    def load_client_keys(self):
-        generate_keys(self.PRIVATE_KEY_FILE, self.PUBLIC_KEY_FILE)
-        try:
-            self.private_key = load_private_key(self.PRIVATE_KEY_FILE)
-            self.public_key_b64 = base64.b64encode(
-                get_public_key_bytes(self.PUBLIC_KEY_FILE)
-            ).decode('utf-8')
-        except Exception:
-            messagebox.showerror("Fatal Error", f"Could not load key files for {self.username}.")
-            self.destroy()
+    # ========================================================
+    # UI
+    # ========================================================
 
     def setup_ui(self):
-        header_font = font.Font(family="Courier", size=16, weight="bold")
-        text_font = font.Font(family="Courier", size=10)
-        
-        header = tk.Label(self, text=":: SECURE TRANSMISSION CHANNEL ::", bg=THEME["bg"], fg=THEME["accent"], font=header_font)
+        header_font = font.Font(
+            family="Courier",
+            size=16,
+            weight="bold",
+        )
+
+        text_font = font.Font(
+            family="Courier",
+            size=10,
+        )
+
+        header = tk.Label(
+            self,
+            text=":: SECURE TRANSMISSION CHANNEL ::",
+            bg=THEME["bg"],
+            fg=THEME["accent"],
+            font=header_font,
+        )
         header.pack(pady=10)
-        
-        main_frame = tk.Frame(self, bg=THEME["bg"])
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
-        
-        self.chat_display = scrolledtext.ScrolledText(main_frame, state='disabled', bg="#000000", fg=THEME["success"], font=text_font, height=20)
-        self.chat_display.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        sidebar = tk.Frame(main_frame, bg="#111111", width=200)
-        sidebar.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+
+        main_frame = tk.Frame(
+            self,
+            bg=THEME["bg"],
+        )
+        main_frame.pack(
+            fill=tk.BOTH,
+            expand=True,
+            padx=20,
+            pady=10,
+        )
+
+        self.chat_display = scrolledtext.ScrolledText(
+            main_frame,
+            state="disabled",
+            bg="#000000",
+            fg=THEME["success"],
+            font=text_font,
+            height=20,
+        )
+        self.chat_display.pack(
+            side=tk.LEFT,
+            fill=tk.BOTH,
+            expand=True,
+        )
+
+        sidebar = tk.Frame(
+            main_frame,
+            bg=THEME["panel"],
+            width=230,
+        )
+        sidebar.pack(
+            side=tk.RIGHT,
+            fill=tk.Y,
+            padx=(10, 0),
+        )
         sidebar.pack_propagate(False)
-        
-        tk.Label(sidebar, text="-- SYSTEM STATUS --", bg="#111111", fg=THEME["accent"], font=header_font).pack(pady=10)
-        info_text = f"\nAGENT ID: {self.username}\nTARGET ID: {self.recipient_name}\n\nNODE: {self.SERVER_HOST}:{self.SERVER_PORT}\nCONNECTION: [CONNECTED]\nPROTOCOL: RSA-2048/OAEP-SHA256\nE2EE: [ACTIVE]\n"
-        tk.Label(sidebar, text=info_text, bg="#111111", fg="#cccccc", justify=tk.LEFT, font=text_font).pack(padx=10, anchor="w")
-        
-        input_frame = tk.Frame(self, bg=THEME["bg"])
-        input_frame.pack(fill=tk.X, padx=20, pady=10)
-        
-        self.msg_entry = tk.Entry(input_frame, bg="#222222", fg="white", font=text_font)
-        self.msg_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
-        self.msg_entry.bind("<Return>", lambda e: self.send_message())
-        
-        btn = tk.Button(input_frame, text="<TRANSMIT>", bg=THEME["accent"], fg="black", font=header_font, command=self.send_message, relief=tk.FLAT)
+
+        tk.Label(
+            sidebar,
+            text="-- SYSTEM STATUS --",
+            bg=THEME["panel"],
+            fg=THEME["accent"],
+            font=header_font,
+        ).pack(pady=10)
+
+        self.info_label = tk.Label(
+            sidebar,
+            text="",
+            bg=THEME["panel"],
+            fg="#cccccc",
+            justify=tk.LEFT,
+            font=text_font,
+        )
+        self.info_label.pack(
+            padx=10,
+            anchor="w",
+        )
+
+        input_frame = tk.Frame(
+            self,
+            bg=THEME["bg"],
+        )
+        input_frame.pack(
+            fill=tk.X,
+            padx=20,
+            pady=10,
+        )
+
+        self.msg_entry = tk.Entry(
+            input_frame,
+            bg=THEME["input"],
+            fg="white",
+            insertbackground="white",
+            font=text_font,
+        )
+        self.msg_entry.pack(
+            side=tk.LEFT,
+            fill=tk.X,
+            expand=True,
+            padx=(0, 10),
+        )
+
+        self.msg_entry.bind(
+            "<Return>",
+            lambda event: self.send_message(),
+        )
+
+        btn = tk.Button(
+            input_frame,
+            text="<TRANSMIT>",
+            bg=THEME["accent"],
+            fg="black",
+            font=header_font,
+            command=self.send_message,
+            relief=tk.FLAT,
+        )
         btn.pack(side=tk.RIGHT)
 
-    def log_message(self, message):
-        self.chat_display.config(state='normal')
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        self.chat_display.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.chat_display.see(tk.END)
-        self.chat_display.config(state='disabled')
+        self.status_var = tk.StringVar(
+            value="INITIALIZING..."
+        )
 
-    def connect_to_server(self):
-        try:
-            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.client_socket.connect((self.SERVER_HOST, self.SERVER_PORT))
-            
-            handshake = {
-                "username": self.username,
-                "public_key": self.public_key_b64
-            }
-            self.client_socket.send(json.dumps(handshake).encode('utf-8'))
-            self.log_message("--- Connected to Server. Requesting Target Key... ---")
-            
-            self.request_target_key()
-            
-            # Start listening thread
-            self.listener_thread = threading.Thread(target=self.receive_messages, daemon=True)
-            self.listener_thread.start()
-            
-        except Exception as e:
-            messagebox.showerror("Connection Error", f"Could not connect to server: {e}")
-            self.destroy()
+        tk.Label(
+            self,
+            textvariable=self.status_var,
+            bg=THEME["bg"],
+            fg=THEME["accent"],
+            font=("Courier", 10),
+        ).pack(
+            pady=(0, 10)
+        )
 
-    def request_target_key(self):
-        req = {
-            "type": "KEY_REQUEST",
-            "target": self.recipient_name
-        }
-        self.client_socket.send(json.dumps(req).encode('utf-8'))
+    def update_identity_display(self):
+        username = (
+            self.identity.username
+            if self.identity
+            else self.username_input
+        )
 
-    def receive_messages(self):
-        while True:
+        info_text = (
+            f"\n"
+            f"AGENT ID: {username}\n"
+            f"TARGET ID: {self.recipient_name}\n"
+            f"\n"
+            f"NODE: {self.server_host}:{self.server_port}\n"
+            f"CONNECTION: [INITIALIZING]\n"
+            f"PROTOCOL: mTLS + Ed25519\n"
+            f"E2EE: X25519 + HKDF + AES-256-GCM\n"
+        )
+
+        self.info_label.config(
+            text=info_text
+        )
+
+    # ========================================================
+    # LOGGING
+    # ========================================================
+
+    def log_message(self, message: str):
+        """
+        Safely update Tkinter from the GUI thread.
+        """
+
+        def update():
             try:
-                message = self.client_socket.recv(4096).decode('utf-8')
-                if not message: 
-                    self.log_message("--- Connection lost to server. ---")
-                    break
-                
-                data = json.loads(message)
-                
-                if data.get("type") == "KEY_RESPONSE":
-                    if data.get("public_key"):
-                        self.recipient_public_key = serialization.load_pem_public_key(
-                            base64.b64decode(data["public_key"])
-                        )
-                        self.log_message(f"--- Target key acquired. Ready to transmit. ---")
-                    else:
-                        self.log_message(f"--- Target {self.recipient_name} is offline. Waiting... ---")
-                
-                elif data.get("type") == "MESSAGE":
-                    try:
-                        encrypted_payload = base64.b64decode(data.get("payload"))
-                        decrypted_msg = decrypt_message(encrypted_payload, self.private_key)
-                        self.log_message(f"RX: {decrypted_msg}")
-                    except Exception as decrypt_error:
-                        self.log_message(f"--- Error decrypting incoming message. (Key mismatch) ---")
-                    
-            except Exception as e:
-                print(f"Receive error: {e}")
-                self.log_message("--- Connection error in listener. ---")
-                break
+                self.chat_display.config(
+                    state="normal"
+                )
+
+                timestamp = time.strftime(
+                    "%H:%M:%S"
+                )
+
+                self.chat_display.insert(
+                    tk.END,
+                    f"[{timestamp}] {message}\n",
+                )
+
+                self.chat_display.see(
+                    tk.END
+                )
+
+                self.chat_display.config(
+                    state="disabled"
+                )
+
+            except tk.TclError:
+                pass
+
+        try:
+            self.after(0, update)
+        except tk.TclError:
+            pass
+
+    def set_status(
+        self,
+        message: str,
+        color=None,
+    ):
+        def update():
+            try:
+                self.status_var.set(message)
+
+            except tk.TclError:
+                pass
+
+        try:
+            self.after(0, update)
+        except tk.TclError:
+            pass
+
+    # ========================================================
+    # SENTRA CLIENT CALLBACKS
+    # ========================================================
+
+    def on_client_message(
+        self,
+        sender: str,
+        plaintext: str,
+    ):
+        """
+        Called by SentraClient after:
+
+            envelope verification
+            ↓
+            AES-GCM decryption
+            ↓
+            plaintext recovered
+        """
+
+        self.log_message(
+            f"RX: {plaintext}"
+        )
+
+    def on_client_event(
+        self,
+        message: str,
+    ):
+        self.log_message(
+            f"-- {message}"
+        )
+
+        if "Connected and authenticated" in message:
+            self.set_status(
+                "CONNECTED + AUTHENTICATED",
+                THEME["success"],
+            )
+
+            self.update_connection_display(
+                "CONNECTED"
+            )
+
+        elif "Connection lost" in message:
+            self.set_status(
+                "CONNECTION LOST - RECONNECTING...",
+                THEME["error"],
+            )
+
+            self.update_connection_display(
+                "RECONNECTING"
+            )
+
+    def update_connection_display(
+        self,
+        state: str,
+    ):
+        def update():
+            try:
+                username = (
+                    self.identity.username
+                    if self.identity
+                    else self.username_input
+                )
+
+                info_text = (
+                    f"\n"
+                    f"AGENT ID: {username}\n"
+                    f"TARGET ID: {self.recipient_name}\n"
+                    f"\n"
+                    f"NODE: {self.server_host}:{self.server_port}\n"
+                    f"CONNECTION: [{state}]\n"
+                    f"PROTOCOL: mTLS + Ed25519\n"
+                    f"E2EE: X25519 + HKDF + AES-256-GCM\n"
+                )
+
+                self.info_label.config(
+                    text=info_text
+                )
+
+            except tk.TclError:
+                pass
+
+        try:
+            self.after(0, update)
+        except tk.TclError:
+            pass
+
+    # ========================================================
+    # CLIENT STARTUP
+    # ========================================================
+
+    def start_client(self):
+        if self.identity is None:
+            raise RuntimeError(
+                "Identity was not initialized"
+            )
+
+        certificate_username = {
+            "RECEIVER": "bob",
+            "SENDER": "alice",
+        }.get(self.identity.username.upper(), self.identity.username)
+
+        certfile = (
+            CERTS
+            / f"client_{certificate_username}.crt"
+        )
+
+        keyfile = (
+            CERTS
+            / f"client_{certificate_username}.key"
+        )
+
+        cafile = CERTS / "ca.crt"
+
+        missing = [
+            str(path)
+            for path in (
+                certfile,
+                keyfile,
+                cafile,
+            )
+            if not path.exists()
+        ]
+
+        if missing:
+            raise FileNotFoundError(
+                "Required SENTRA certificate files are missing:\n\n"
+                + "\n".join(missing)
+                + "\n\n"
+                "Generate development certificates first."
+            )
+
+        self.client = SentraClient(
+            host=self.server_host,
+            port=self.server_port,
+            certfile=str(certfile),
+            keyfile=str(keyfile),
+            cafile=str(cafile),
+            identity=self.identity,
+            on_message=self.on_client_message,
+            on_event=self.on_client_event,
+        )
+
+        self.log_message(
+            "--- Starting SENTRA secure client... ---"
+        )
+
+        self.update_connection_display(
+            "CONNECTING"
+        )
+
+        self.client_thread = threading.Thread(
+            target=self.client.run_forever,
+            daemon=True,
+        )
+
+        self.client_thread.start()
+
+    # ========================================================
+    # SEND MESSAGE
+    # ========================================================
 
     def send_message(self):
         msg = self.msg_entry.get().strip()
+
         if not msg:
             return
-            
-        if not self.recipient_public_key:
-            self.request_target_key()
-            self.log_message(f"--- Requesting key for {self.recipient_name} again... ---")
+
+        if self.client is None:
+            self.log_message(
+                "--- Client is not initialized. ---"
+            )
             return
 
         try:
-            encrypted_payload = encrypt_message(msg, self.recipient_public_key)
-            payload_b64 = base64.b64encode(encrypted_payload).decode('utf-8')
-            
-            packet = {
-                "type": "MESSAGE",
-                "sender": self.username,
-                "target": self.recipient_name,
-                "payload": payload_b64,
-                "timestamp": str(datetime.datetime.now())
-            }
-            
-            self.client_socket.send(json.dumps(packet).encode('utf-8'))
-            self.log_message(f"TX: {msg}")
-            self.msg_entry.delete(0, tk.END)
-            
-        except Exception as e:
-            self.log_message(f"--- Transmission Error: {e} ---")
+            if not self.client.wait_until_connected(
+                timeout=0.1
+            ):
+                self.log_message(
+                    "--- Client is not connected yet. Please wait. ---"
+                )
+                return
+
+            message_id = self.client.send_message(
+                self.recipient_name,
+                msg,
+            )
+
+            self.log_message(
+                f"TX: {msg}"
+            )
+
+            self.log_message(
+                f"-- Encrypted message sent: {message_id}"
+            )
+
+            self.msg_entry.delete(
+                0,
+                tk.END,
+            )
+
+        except Exception as exc:
+            self.log_message(
+                f"--- Transmission Error: {exc} ---"
+            )
+
+    # ========================================================
+    # CLOSE
+    # ========================================================
 
     def on_closing(self):
-        if self.client_socket:
-            self.client_socket.close()
+        try:
+            if self.client is not None:
+                self.client.stop()
+        except Exception:
+            pass
+
         self.destroy()
 
-# --- Main Launcher UI ---
+
+# ============================================================
+# MAIN LAUNCHER
+# ============================================================
+
 class AppLauncher(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("SENTRA Launcher")
-        self.geometry("600x500")
-        self.configure(bg=THEME["bg"])
-        
-        tk.Label(self, text="SENTRA INITIATOR", bg=THEME["bg"], fg=THEME["accent"], font=("Courier", 24, "bold")).pack(pady=20)
-        
-        status_frame = tk.Frame(self, bg=THEME["bg"], highlightbackground="#ff00ff", highlightthickness=2)
-        status_frame.pack(fill=tk.X, padx=40, pady=10)
-        
-        self.status_label = tk.Label(status_frame, text="Server Offline", bg=THEME["bg"], fg=THEME["error"], font=("Courier", 12))
-        self.status_label.pack(side=tk.LEFT, padx=10, pady=10)
-        
-        tk.Button(status_frame, text="ONLINE", bg=THEME["accent"], fg="black", font=("Courier", 10, "bold"), command=self.start_server).pack(side=tk.RIGHT, padx=10, pady=5)
-        
-        form_frame = tk.Frame(self, bg=THEME["bg"], highlightbackground="#ff00ff", highlightthickness=2)
-        form_frame.pack(fill=tk.BOTH, expand=True, padx=40, pady=20)
-        
-        tk.Label(form_frame, text=":: DEPLOY AGENT TERMINAL ::", bg=THEME["bg"], fg=THEME["accent"], font=("Courier", 14)).pack(pady=15)
-        
-        input_grid = tk.Frame(form_frame, bg=THEME["bg"])
-        input_grid.pack(pady=10)
-        
-        tk.Label(input_grid, text="AGENT ID:", bg=THEME["bg"], fg="white", font=("Courier", 12)).grid(row=0, column=0, sticky="w", pady=5)
-        self.agent_id_entry = tk.Entry(input_grid, bg="#333", fg="white", font=("Courier", 12))
-        self.agent_id_entry.insert(0, "RECEIVER")
-        self.agent_id_entry.grid(row=0, column=1, pady=5, padx=10)
-        
-        tk.Label(input_grid, text="TARGET ID:", bg=THEME["bg"], fg="white", font=("Courier", 12)).grid(row=1, column=0, sticky="w", pady=5)
-        self.target_id_entry = tk.Entry(input_grid, bg="#333", fg="white", font=("Courier", 12))
-        self.target_id_entry.insert(0, "SENDER")
-        self.target_id_entry.grid(row=1, column=1, pady=5, padx=10)
-        
-        tk.Button(form_frame, text="<LAUNCH>", bg=THEME["accent"], fg="black", font=("Courier", 14, "bold"), command=self.launch_terminal).pack(fill=tk.X, padx=40, pady=30)
+
+        self.title(
+            "SENTRA Launcher"
+        )
+
+        self.geometry(
+            "600x500"
+        )
+
+        self.configure(
+            bg=THEME["bg"]
+        )
+
+        self.server: SentraServer | None = None
+        self.server_thread: threading.Thread | None = None
+
+        tk.Label(
+            self,
+            text="SENTRA INITIATOR",
+            bg=THEME["bg"],
+            fg=THEME["accent"],
+            font=("Courier", 24, "bold"),
+        ).pack(
+            pady=20
+        )
+
+        status_frame = tk.Frame(
+            self,
+            bg=THEME["bg"],
+            highlightbackground="#ff00ff",
+            highlightthickness=2,
+        )
+        status_frame.pack(
+            fill=tk.X,
+            padx=40,
+            pady=10,
+        )
+
+        self.status_label = tk.Label(
+            status_frame,
+            text="Server Offline",
+            bg=THEME["bg"],
+            fg=THEME["error"],
+            font=("Courier", 12),
+        )
+
+        self.status_label.pack(
+            side=tk.LEFT,
+            padx=10,
+            pady=10,
+        )
+
+        self.server_button = tk.Button(
+            status_frame,
+            text="ONLINE",
+            bg=THEME["accent"],
+            fg="black",
+            font=("Courier", 10, "bold"),
+            command=self.start_server,
+        )
+
+        self.server_button.pack(
+            side=tk.RIGHT,
+            padx=10,
+            pady=5,
+        )
+
+        form_frame = tk.Frame(
+            self,
+            bg=THEME["bg"],
+            highlightbackground="#ff00ff",
+            highlightthickness=2,
+        )
+
+        form_frame.pack(
+            fill=tk.BOTH,
+            expand=True,
+            padx=40,
+            pady=20,
+        )
+
+        tk.Label(
+            form_frame,
+            text=":: DEPLOY AGENT TERMINAL ::",
+            bg=THEME["bg"],
+            fg=THEME["accent"],
+            font=("Courier", 14),
+        ).pack(
+            pady=15
+        )
+
+        input_grid = tk.Frame(
+            form_frame,
+            bg=THEME["bg"],
+        )
+
+        input_grid.pack(
+            pady=10
+        )
+
+        tk.Label(
+            input_grid,
+            text="AGENT ID:",
+            bg=THEME["bg"],
+            fg="white",
+            font=("Courier", 12),
+        ).grid(
+            row=0,
+            column=0,
+            sticky="w",
+            pady=5,
+        )
+
+        self.agent_id_entry = tk.Entry(
+            input_grid,
+            bg="#333",
+            fg="white",
+            insertbackground="white",
+            font=("Courier", 12),
+        )
+
+        self.agent_id_entry.insert(
+            0,
+            "RECEIVER",
+        )
+
+        self.agent_id_entry.grid(
+            row=0,
+            column=1,
+            pady=5,
+            padx=10,
+        )
+
+        tk.Label(
+            input_grid,
+            text="TARGET ID:",
+            bg=THEME["bg"],
+            fg="white",
+            font=("Courier", 12),
+        ).grid(
+            row=1,
+            column=0,
+            sticky="w",
+            pady=5,
+        )
+
+        self.target_id_entry = tk.Entry(
+            input_grid,
+            bg="#333",
+            fg="white",
+            insertbackground="white",
+            font=("Courier", 12),
+        )
+
+        self.target_id_entry.insert(
+            0,
+            "SENDER",
+        )
+
+        self.target_id_entry.grid(
+            row=1,
+            column=1,
+            pady=5,
+            padx=10,
+        )
+
+        tk.Button(
+            form_frame,
+            text="<LAUNCH>",
+            bg=THEME["accent"],
+            fg="black",
+            font=("Courier", 14, "bold"),
+            command=self.launch_terminal,
+        ).pack(
+            fill=tk.X,
+            padx=40,
+            pady=30,
+        )
+
+        self.protocol(
+            "WM_DELETE_WINDOW",
+            self.on_closing,
+        )
+
+    # ========================================================
+    # SERVER
+    # ========================================================
 
     def start_server(self):
-        def update_status(msg, color):
-            self.status_label.config(text=msg, fg=color)
-        threading.Thread(target=start_server_logic, args=(update_status,), daemon=True).start()
+        if self.server_thread and self.server_thread.is_alive():
+            self.status_label.config(
+                text="Server already ONLINE",
+                fg=THEME["success"],
+            )
+            return
+
+        try:
+            DATA.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            required_files = [
+                CERTS / "server.crt",
+                CERTS / "server.key",
+                CERTS / "ca.crt",
+            ]
+
+            missing = [
+                str(path)
+                for path in required_files
+                if not path.exists()
+            ]
+
+            if missing:
+                messagebox.showerror(
+                    "Certificates Missing",
+                    "Generate SENTRA development certificates first:\n\n"
+                    "python scripts/generate_dev_certs.py "
+                    "--clients SENDER RECEIVER\n\n"
+                    "Missing:\n"
+                    + "\n".join(missing),
+                    parent=self,
+                )
+                return
+
+            self.server = SentraServer(
+                host=SERVER_HOST,
+                port=SERVER_PORT,
+                certfile=str(
+                    CERTS / "server.crt"
+                ),
+                keyfile=str(
+                    CERTS / "server.key"
+                ),
+                cafile=str(
+                    CERTS / "ca.crt"
+                ),
+                registry_db=str(
+                    DATA / "registry.db"
+                ),
+                offline_db=str(
+                    DATA / "offline_queue.db"
+                ),
+            )
+
+            self.server_thread = threading.Thread(
+                target=self.run_server,
+                daemon=True,
+            )
+
+            self.server_thread.start()
+
+            self.status_label.config(
+                text=f"Server ONLINE @ {SERVER_HOST}:{SERVER_PORT}",
+                fg=THEME["success"],
+            )
+
+            self.server_button.config(
+                state=tk.DISABLED,
+                text="ONLINE",
+            )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Server Error",
+                f"Could not start SENTRA server:\n\n{exc}",
+                parent=self,
+            )
+
+    def run_server(self):
+        try:
+            self.server.start()
+        except Exception as exc:
+            self.after(
+                0,
+                lambda: self.status_label.config(
+                    text=f"Server Error: {exc}",
+                    fg=THEME["error"],
+                ),
+            )
+
+    # ========================================================
+    # LAUNCH CLIENT
+    # ========================================================
 
     def launch_terminal(self):
-        agent_id = self.agent_id_entry.get().strip()
-        target_id = self.target_id_entry.get().strip()
-        
+        agent_id = (
+            self.agent_id_entry
+            .get()
+            .strip()
+        )
+
+        target_id = (
+            self.target_id_entry
+            .get()
+            .strip()
+        )
+
         if not agent_id or not target_id:
-            messagebox.showerror("Error", "Agent ID and Target ID required.")
+            messagebox.showerror(
+                "Error",
+                "Agent ID and Target ID are required.",
+                parent=self,
+            )
             return
-            
-        os.makedirs(f"data_{target_id}", exist_ok=True)
-        generate_keys(f"data_{target_id}/private_key.pem", f"data_{target_id}/public_key.pem")
-            
-        SecureMessagingApp(self, agent_id, target_id)
+
+        if agent_id.lower() == target_id.lower():
+            messagebox.showerror(
+                "Error",
+                "Agent ID and Target ID must be different.",
+                parent=self,
+            )
+            return
+
+        if not self.server_thread or not self.server_thread.is_alive():
+            messagebox.showwarning(
+                "Server Offline",
+                "Click ONLINE first to start the SENTRA server.",
+                parent=self,
+            )
+            return
+
+        passphrase = simpledialog.askstring(
+            "Identity Vault",
+            f"Enter the vault passphrase for '{agent_id}':",
+            show="*",
+            parent=self,
+        )
+
+        if passphrase is None:
+            return
+
+        if not passphrase:
+            messagebox.showerror(
+                "Invalid Passphrase",
+                "A non-empty vault passphrase is required.",
+                parent=self,
+            )
+            return
+
+        SecureMessagingApp(
+            self,
+            agent_id,
+            target_id,
+            passphrase,
+        )
+
+    # ========================================================
+    # CLOSE
+    # ========================================================
+
+    def on_closing(self):
+        try:
+            if self.server is not None:
+                self.server.stop()
+        except Exception:
+            pass
+
+        self.destroy()
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
-    if sys.platform == "win32" and not is_admin():
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Administrator Privileges Required", "This application requires administrator privileges to bind to a network port.\n\nPlease right-click the script and select 'Run as administrator'.")
-        sys.exit(1)
-
-    try:
-        from cryptography.hazmat.primitives.asymmetric import rsa, padding
-        from cryptography.hazmat.primitives import hashes, serialization
-    except ImportError:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Dependency Missing", "The 'cryptography' library is required.\nPlease install it using: pip install cryptography")
-        sys.exit(1)
-
     app = AppLauncher()
     app.mainloop()
