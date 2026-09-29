@@ -437,6 +437,12 @@ class SecureMessagingApp(tk.Toplevel):
             "SENDER": "alice",
         }.get(self.identity.username.upper(), self.identity.username)
 
+        if not (
+            (CERTS / f"client_{certificate_username}.crt").is_file()
+            and (CERTS / f"client_{certificate_username}.key").is_file()
+        ):
+            certificate_username = self.identity.username
+
         certfile = (
             CERTS
             / f"client_{certificate_username}.crt"
