@@ -68,7 +68,8 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             username TEXT PRIMARY KEY,
             public_key_pem TEXT NOT NULL,
             status TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            totp_secret TEXT
         )
         """
     )
@@ -103,6 +104,13 @@ def init_registry(db_path: PathType) -> None:
     try:
         with connection:
             _ensure_schema(connection)
+            # Backward-compatible migration: databases created before TOTP
+            # support lack the totp_secret column. Add it when missing.
+            # The column is nullable; NULL means "2FA not enrolled."
+            cursor = connection.execute("PRAGMA table_info(users)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "totp_secret" not in columns:
+                connection.execute("ALTER TABLE users ADD COLUMN totp_secret TEXT")
     finally:
         connection.close()
 
@@ -219,6 +227,108 @@ def set_user_status(db_path: PathType, username: str, status: str) -> None:
             cursor = connection.execute(
                 "UPDATE users SET status = ? WHERE username = ?",
                 (validated_status, normalized_username),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Unknown username: {normalized_username}")
+    finally:
+        connection.close()
+
+
+def set_totp_secret(db_path: PathType, username: str, secret_b32: str) -> None:
+    """Store a Base32 TOTP secret for a registered user.
+
+    The secret is stored as-is (plaintext). This is a demo limitation, not a
+    production pattern; a production deployment must encrypt secrets at rest.
+
+    Args:
+        db_path: SQLite database path.
+        username: Username to update; surrounding whitespace is removed.
+        secret_b32: Non-empty Base32-encoded TOTP secret.
+
+    Returns:
+        None: The user's TOTP secret is updated.
+
+    Raises:
+        TypeError: If username or secret_b32 has an invalid type.
+        ValueError: If username or secret_b32 is empty.
+        KeyError: If username is not registered.
+        OSError: If the database cannot be opened or written.
+        sqlite3.Error: If SQLite reports another database error.
+    """
+    normalized_username = _normalize_username(username)
+    if not isinstance(secret_b32, str):
+        raise TypeError("secret_b32 must be a string")
+    if not secret_b32:
+        raise ValueError("secret_b32 must not be empty")
+    init_registry(db_path)
+    connection = _connect(db_path)
+    try:
+        with connection:
+            cursor = connection.execute(
+                "UPDATE users SET totp_secret = ? WHERE username = ?",
+                (secret_b32, normalized_username),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Unknown username: {normalized_username}")
+    finally:
+        connection.close()
+
+
+def get_totp_secret(db_path: PathType, username: str) -> str | None:
+    """Retrieve a registered user's Base32 TOTP secret.
+
+    Args:
+        db_path: SQLite database path.
+        username: Username to look up; surrounding whitespace is removed.
+
+    Returns:
+        str | None: The stored secret, or None when the user is unregistered
+            or has no secret enrolled.
+
+    Raises:
+        TypeError: If username is not a string.
+        ValueError: If username is empty.
+        OSError: If the database cannot be opened or read.
+        sqlite3.Error: If SQLite reports a database error.
+    """
+    normalized_username = _normalize_username(username)
+    init_registry(db_path)
+    connection = _connect(db_path)
+    try:
+        row = connection.execute(
+            "SELECT totp_secret FROM users WHERE username = ?",
+            (normalized_username,),
+        ).fetchone()
+    finally:
+        connection.close()
+    return None if row is None else row[0]
+
+
+def clear_totp_secret(db_path: PathType, username: str) -> None:
+    """Remove a registered user's TOTP secret (set the column to NULL).
+
+    Args:
+        db_path: SQLite database path.
+        username: Username to update; surrounding whitespace is removed.
+
+    Returns:
+        None: The user's TOTP secret is cleared.
+
+    Raises:
+        TypeError: If username is not a string.
+        ValueError: If username is empty.
+        KeyError: If username is not registered.
+        OSError: If the database cannot be opened or written.
+        sqlite3.Error: If SQLite reports another database error.
+    """
+    normalized_username = _normalize_username(username)
+    init_registry(db_path)
+    connection = _connect(db_path)
+    try:
+        with connection:
+            cursor = connection.execute(
+                "UPDATE users SET totp_secret = NULL WHERE username = ?",
+                (normalized_username,),
             )
             if cursor.rowcount == 0:
                 raise KeyError(f"Unknown username: {normalized_username}")

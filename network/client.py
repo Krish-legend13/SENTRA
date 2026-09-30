@@ -50,6 +50,7 @@ class SentraClient:
         identity: IdentityManager,
         on_message=None,
         on_event=None,
+        on_totp_required=None,
     ) -> None:
         self.host = host
         self.port = port
@@ -57,6 +58,7 @@ class SentraClient:
         self.identity = identity
         self.on_message = on_message or (lambda sender, text: print(f"[{sender}] {text}"))
         self.on_event = on_event or (lambda msg: print(f"-- {msg}"))
+        self.on_totp_required = on_totp_required or (lambda: input("Enter 6-digit 2FA code: "))
 
         self._sock: ssl.SSLSocket | None = None
         self._send_lock = threading.Lock()
@@ -185,7 +187,14 @@ class SentraClient:
             }
         )
 
-        result_packet = recv_packet(self._sock)
+        packet = recv_packet(self._sock)
+        if packet.get("type") == "TOTP_CHALLENGE":
+            code = self.on_totp_required()
+            if not isinstance(code, str) or not code.strip():
+                raise ConnectionClosed("TOTP code not provided")
+            self._send({"type": "TOTP_RESPONSE", "code": code.strip()})
+            packet = recv_packet(self._sock)
+        result_packet = packet
         if result_packet.get("type") != "AUTH_RESULT" or result_packet.get("status") != "OK":
             raise ConnectionClosed(
                 f"Authentication failed: {result_packet.get('reason')}"

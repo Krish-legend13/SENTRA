@@ -422,6 +422,37 @@ class SecureMessagingApp(tk.Toplevel):
         except tk.TclError:
             pass
 
+    def _prompt_totp(self) -> str | None:
+        """Prompt for a TOTP code from the GUI thread and block the caller.
+
+        Called by SentraClient on its worker thread during reconnection.
+        Uses after(0, ...) plus an Event so the dialog runs on the Tk main
+        thread while the client thread waits for the result.
+        """
+        result: list[str | None] = []
+        done = threading.Event()
+
+        def show():
+            try:
+                code = simpledialog.askstring(
+                    "Two-Factor Authentication",
+                    f"Enter the 6-digit 2FA code for '{self.username_input}':",
+                    parent=self,
+                )
+            except tk.TclError:
+                code = None
+            result.append(code)
+            done.set()
+
+        try:
+            self.after(0, show)
+        except tk.TclError:
+            return None
+
+        if not done.wait(timeout=90):
+            return None
+        return result[0] if result else None
+
     # ========================================================
     # CLIENT STARTUP
     # ========================================================
@@ -482,6 +513,7 @@ class SecureMessagingApp(tk.Toplevel):
             identity=self.identity,
             on_message=self.on_client_message,
             on_event=self.on_client_event,
+            on_totp_required=self._prompt_totp,
         )
 
         self.log_message(

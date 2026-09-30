@@ -319,3 +319,52 @@ class TOTPReplayGuard:
         """
         with self._lock:
             return len(self._counters)
+
+
+def verify_with_replay_guard(
+    secret_b32: str,
+    code: str,
+    identity: str,
+    guard: TOTPReplayGuard,
+    timestamp: float | None = None,
+    window: int = DEFAULT_WINDOW,
+) -> tuple[bool, str]:
+    """Verify a TOTP code with per-identity replay protection.
+
+    Decodes the stored Base32 secret, locates the matching counter, and only
+    accepts a counter that the replay guard has not already consumed for this
+    identity. The guard's state is mutated only when a counter matches; an
+    invalid code leaves it untouched.
+
+    Args:
+        secret_b32: Base32-encoded TOTP secret as stored in the registry.
+        code: Candidate six-digit TOTP code.
+        identity: Identity the replay guard tracks (typically the username).
+        guard: Shared, thread-safe replay guard.
+        timestamp: Unix timestamp, or the current time when omitted.
+        window: Number of steps before and after the current step to check.
+
+    Returns:
+        tuple[bool, str]: ``(True, "ok")`` on success, otherwise
+            ``(False, reason)`` where reason is ``"invalid_stored_secret"``,
+            ``"invalid_code"``, or ``"replayed_code"``.
+
+    Raises:
+        TypeError: If secret_b32 or code is not a string.
+        ValueError: If the secret is empty, the timestamp is negative, or the
+            window is negative.
+    """
+    if not isinstance(secret_b32, str):
+        raise TypeError("secret_b32 must be a string")
+    if not isinstance(code, str):
+        raise TypeError("code must be a string")
+    try:
+        secret = base32_to_secret(secret_b32)
+    except ValueError:
+        return (False, "invalid_stored_secret")
+    counter = find_matching_counter(secret, code, timestamp, window)
+    if counter is None:
+        return (False, "invalid_code")
+    if not guard.check_and_record(identity, counter):
+        return (False, "replayed_code")
+    return (True, "ok")

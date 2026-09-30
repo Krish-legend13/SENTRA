@@ -28,7 +28,8 @@ import time
 import uuid
 
 from auth.challenge import ChallengeStore, verify_response
-from auth.registry import AUTHORIZED, get_user, init_registry, register_user
+from auth.registry import AUTHORIZED, get_totp_secret, get_user, init_registry, register_user
+from auth.totp import TOTPReplayGuard, verify_with_replay_guard
 from crypto.keys import deserialize_public_key, fingerprint
 from network import offline_queue
 from network.framing import ConnectionClosed, FrameError, recv_packet, send_packet
@@ -68,6 +69,7 @@ class SentraServer:
 
         self.sessions = SessionManager()
         self.challenges = ChallengeStore()
+        self.totp_guard = TOTPReplayGuard()
         self.incidents = IncidentDetector()
 
         # message_id -> sender username, so a MESSAGE_ACK from the recipient
@@ -265,11 +267,64 @@ class SentraServer:
 
         self.incidents.clear_auth_failures(client_ip)
         self.incidents.clear_auth_failures(username)
+
+        # Optional second factor: only users with a registered TOTP secret
+        # are challenged. Everyone else continues through Ed25519 alone.
+        totp_secret_b32 = get_totp_secret(self.registry_db, username)
+        if totp_secret_b32 is not None:
+            if not self._run_totp_step(sock, username, totp_secret_b32, peer_addr, client_ip):
+                return None
+
         # AUTH_RESULT:OK is sent by the caller only after the session is
         # registered, so a peer never receives "you're authenticated" before
         # the server can actually route messages to it (closes a race where
         # a sender could get DELIVERY_STATUS:OFFLINE for an online peer).
         return username
+
+    def _run_totp_step(
+        self,
+        sock,
+        username: str,
+        secret_b32: str,
+        peer_addr: str,
+        client_ip: str,
+    ) -> bool:
+        """Challenge and verify a TOTP code for an Ed25519-authenticated user.
+
+        Returns True if the code verifies and is not a replay, otherwise False.
+        """
+        self._send_raw(sock, {"type": "TOTP_CHALLENGE", "required": True})
+        try:
+            packet = recv_packet(sock)
+        except (ConnectionClosed, FrameError, OSError):
+            return False
+
+        if packet.get("type") != "TOTP_RESPONSE":
+            self._send_raw(sock, {"type": "AUTH_RESULT", "status": "FAILED", "reason": "expected_totp_response"})
+            return False
+
+        code = packet.get("code")
+        if not isinstance(code, str) or len(code) != 6 or not code.isdigit():
+            code = ""
+
+        ok, reason = verify_with_replay_guard(secret_b32, code, username, self.totp_guard)
+        if ok:
+            self.incidents.clear_auth_failures(client_ip)
+            self.incidents.clear_auth_failures(username)
+            log_event("TOTP_SUCCESS", actor=username, peer_addr=peer_addr)
+            return True
+
+        self.incidents.record_auth_failure(client_ip, peer_addr)
+        self.incidents.record_auth_failure(username, peer_addr)
+        log_event(
+            "TOTP_FAILURE",
+            severity="WARNING",
+            actor=username,
+            peer_addr=peer_addr,
+            detail={"reason": reason},
+        )
+        self._send_raw(sock, {"type": "AUTH_RESULT", "status": "FAILED", "reason": reason})
+        return False
 
     def _handle_register(self, sock, packet: dict, peer_addr: str) -> None:
         username = packet.get("username")

@@ -8,10 +8,13 @@ from .challenge import (
 )
 from .registry import (
     UserRecord,
+    clear_totp_secret,
+    get_totp_secret,
     get_user,
     init_registry,
     list_users,
     register_user,
+    set_totp_secret,
     set_user_status,
 )
 from .recovery import (
@@ -29,17 +32,21 @@ from .totp import (
     generate_totp_secret,
     secret_to_base32,
     verify_totp,
+    verify_with_replay_guard,
 )
 
 __all__ = [
     "ChallengeStore",
     "UserRecord",
+    "clear_totp_secret",
     "create_response",
     "generate_challenge",
+    "get_totp_secret",
     "get_user",
     "init_registry",
     "list_users",
     "register_user",
+    "set_totp_secret",
     "set_user_status",
     "verify_response",
     "TOTPReplayGuard",
@@ -50,6 +57,7 @@ __all__ = [
     "generate_totp_secret",
     "secret_to_base32",
     "verify_totp",
+    "verify_with_replay_guard",
     "consume_recovery_code",
     "generate_recovery_codes",
     "hash_recovery_code",

@@ -149,6 +149,49 @@ Authentication signatures use `SENTRA-AUTH-v1`; message signatures use `SENTRA-M
   **Resolved: yes, both.** mTLS authenticates the transport (holder of a CA-issued cert); the
   Ed25519 challenge-response in `auth.challenge` independently authenticates the application
   identity. Neither layer substitutes for the other.
+- How are TOTP recovery codes integrated into the authentication flow?
+  **Deferred.** `auth/recovery.py` is implemented and tested but not yet wired into
+  authentication. TOTP enrollment currently offers no fallback if a user loses their
+  authenticator; recovery-code integration is future work.
+
+## Two-Factor Authentication (TOTP)
+
+TOTP (RFC 6238) is an **optional** second factor layered on top of the existing
+Ed25519 challenge-response authentication. A user with no registered TOTP
+secret authenticates with Ed25519 alone, exactly as before; a user with a
+registered secret must also present a valid six-digit code.
+
+### Flow
+
+1. The client sends `AUTH_REQUEST` and completes the Ed25519 challenge-response
+   exchange (`AUTH_CHALLENGE` → `AUTH_RESPONSE`) as usual.
+2. After Ed25519 verification succeeds, the server looks up the user's TOTP
+   secret. If none is registered, authentication proceeds directly to the
+   existing `AUTH_RESULT` with `status: OK`.
+3. If a secret is registered, the server sends `TOTP_CHALLENGE` with
+   `required: true`.
+4. The client replies with `TOTP_RESPONSE` carrying the six-digit `code`.
+5. The server verifies the code against the user's secret (with per-user replay
+   protection) and sends the existing `AUTH_RESULT` with `status: OK` on
+   success, or `status: FAILED` with a `reason` of `invalid_code`,
+   `replayed_code`, or `expected_totp_response`.
+
+### New packet types
+
+| Type | Direction | Fields | Purpose |
+|---|---|---|---|
+| `TOTP_CHALLENGE` | server → client | `required` | Requests a six-digit TOTP code after Ed25519 verification succeeds |
+| `TOTP_RESPONSE` | client → server | `code` | Carries the six-digit TOTP code in reply to `TOTP_CHALLENGE` |
+
+### Storage and limitations
+
+The TOTP secret is stored **plaintext** in the SQLite registry
+(`data/registry.db`, column `totp_secret`) for the demo; a production
+deployment must encrypt the secret at rest. Replay protection is per-user: the
+same code cannot be accepted twice within the same 30-second step window, even
+across two different connections. TOTP failures count toward the existing
+incident-detection auth-failure thresholds; there is no separate per-user TOTP
+rate limiter.
 
 ## Network-layer packet type additions
 
@@ -172,3 +215,6 @@ thresholds, structured event log format, and how to run a local demo).
 - `0.2` — network layer implemented: mTLS transport, heartbeat/ACK/reconnect/multi-session/offline
   queue packet types and behavior, structured security events, backend incident detection. See
   `NETWORK.md`.
+- `0.2-draft` — optional TOTP second factor: `TOTP_CHALLENGE`/`TOTP_RESPONSE` packets, per-user
+  replay guard, and console enrollment via `scripts/enroll_totp.py`. TOTP secrets are stored
+  plaintext in the registry for the demo; recovery-code integration remains deferred.
